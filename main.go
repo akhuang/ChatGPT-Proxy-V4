@@ -23,12 +23,16 @@ var (
 	client, _    = tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
 	access_token = os.Getenv("ACCESS_TOKEN")
 	puid         = os.Getenv("PUID")
-	http_proxy        = os.Getenv("http_proxy")
+	http_proxy   = os.Getenv("http_proxy")
+	auth_proxy   = os.Getenv("auth_proxy")
+	openai_email = os.Getenv("OPENAI_EMAIL")
+	openai_pass  = os.Getenv("OPENAI_PASS")
+	admin_pass   = os.Getenv("ADMIN_PASS")
 )
 
 func main() {
-	if access_token == "" && puid == "" {
-		println("Error: ACCESS_TOKEN and PUID are not set")
+	if access_token == "" && puid == "" && openai_email == "" && openai_pass == "" {
+		println("Error: Authentication information not found.")
 		return
 	}
 
@@ -37,56 +41,14 @@ func main() {
 		println("Proxy set:" + http_proxy)
 	}
 	// Automatically refresh the puid cookie
-	if access_token != "" {
+	if openai_email != "" && openai_pass != "" {
+		go refresh_access_token()
+	} else if access_token != "" {
 		go func() {
-			url := "https://chat.openai.com/backend-api/models"
-			req, _ := http.NewRequest(http.MethodGet, url, nil)
-			req.Header.Set("Host", "chat.openai.com")
-			req.Header.Set("origin", "https://chat.openai.com/chat")
-			req.Header.Set("referer", "https://chat.openai.com/chat")
-			req.Header.Set("sec-ch-ua", `Chromium";v="110", "Not A(Brand";v="24", "Brave";v="110`)
-			req.Header.Set("sec-ch-ua-platform", "Linux")
-			req.Header.Set("content-type", "application/json")
-			req.Header.Set("content-type", "application/json")
-			req.Header.Set("accept", "text/event-stream")
-			req.Header.Set("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36")
-			// Set authorization header
-			req.Header.Set("Authorization", "Bearer "+access_token)
-			// Initial puid cookie
-			req.AddCookie(
-				&http.Cookie{
-					Name:  "_puid",
-					Value: puid,
-				},
-			)
 			for {
-				resp, err := client.Do(req)
-				if err != nil {
-					break
-				}
-				defer resp.Body.Close()
-				println("Got response: " + resp.Status)
-				if resp.StatusCode != 200 {
-					println("Error: " + resp.Status)
-					// Print response body
-					body, _ := io.ReadAll(resp.Body)
-					println(string(body))
-					break
-				}
-				// Get cookies from response
-				cookies := resp.Cookies()
-				// Find _puid cookie
-				for _, cookie := range cookies {
-					if cookie.Name == "_puid" {
-						puid = cookie.Value
-						println("puid: " + puid)
-						break
-					}
-				}
-				// Sleep for 6 hour
+				refresh_puid()
 				time.Sleep(6 * time.Hour)
 			}
-			println("Error: Failed to refresh puid cookie")
 		}()
 	}
 
@@ -101,6 +63,46 @@ func main() {
 
 	handler.Any("/api/*path", proxy)
 
+	handler.POST("/admin/update", func(c *gin.Context) {
+		if c.Request.Header.Get("Authorization") != admin_pass {
+			c.JSON(401, gin.H{"message": "unauthorized"})
+			return
+		}
+		type Update struct {
+			Value string `json:"value"`
+			Field string `json:"field"`
+		}
+		var update Update
+		c.BindJSON(&update)
+		if update.Field == "puid" {
+			puid = update.Value
+			// export environment variable
+			os.Setenv("PUID", puid)
+		} else if update.Field == "access_token" {
+			access_token = update.Value
+			os.Setenv("ACCESS_TOKEN", access_token)
+		} else if update.Field == "http_proxy" {
+			http_proxy = update.Value
+			client.SetProxy(http_proxy)
+		} else if update.Field == "openai_email" {
+			openai_email = update.Value
+			os.Setenv("OPENAI_EMAIL", openai_email)
+		} else if update.Field == "openai_pass" {
+			openai_pass = update.Value
+			os.Setenv("OPENAI_PASS", openai_pass)
+		} else if update.Field == "admin_pass" {
+			admin_pass = update.Value
+			os.Setenv("ADMIN_PASS", admin_pass)
+		} else if update.Field == "auth_proxy" {
+			auth_proxy = update.Value
+			os.Setenv("auth_proxy", auth_proxy)
+		} else {
+			c.JSON(400, gin.H{"message": "field not found"})
+			return
+		}
+		c.JSON(200, gin.H{"message": "updated"})
+	})
+	gin.SetMode(gin.ReleaseMode)
 	endless.ListenAndServe(os.Getenv("HOST")+":"+PORT, handler)
 }
 
@@ -112,7 +114,11 @@ func proxy(c *gin.Context) {
 	var request *http.Request
 	var response *http.Response
 
-	url = "https://chat.openai.com/backend-api" + c.Param("path")
+	if c.Request.URL.RawQuery != "" {
+		url = "https://chat.openai.com/backend-api" + c.Param("path") + "?" + c.Request.URL.RawQuery
+	} else {
+		url = "https://chat.openai.com/backend-api" + c.Param("path")
+	}
 	request_method = c.Request.Method
 
 	request, err = http.NewRequest(request_method, url, c.Request.Body)
